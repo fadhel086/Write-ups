@@ -1,0 +1,9 @@
+
+= Conclusion
+
+As mentioned in introduction, writing good driver codes requires fair knowledge in both software and hardware of the system. The article focussed on the what are the best practices to follow while writing simple character drivers.
+
+
+
+
+

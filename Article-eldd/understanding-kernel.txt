@@ -1,0 +1,100 @@
+
+= Understanding the kernel
+
+Linux is a monolithic kernel, i.e. to say that the entire kernel is present at a single address space, known as kernel space. Thus any piece of code, we insert into the kernel is part of the entire kernel. Unlike application programs, kernel code runs with high privileges and drivers inserted by user also runs with high privileges. Thus utmost care must be taken to write kernel modules. A small mistake(non-terminating loops, non-properly de-initialized module, dangling pointers … etc), can bring the entire system down.
+
+Current systems are inherently concurrent, due to Symmetric multiprocessing (SMP), kernel preemption and interrupts. Thus drivers should take care to protect shared global data structures or hardware resources from corruption or else it could jeopardise the entire system.
+
+Below code snippet shows how simultaneously executing threads can modify a global data in unpredictable ways. The order in which threads modify the variable cannot be predicted and  leads to race condition (Situation when two or more threads tries to access the same resources at the same time).
+
+[c, code-snippet]
+
+Static int counter;
+
+void kernel_thread1(void) {counter++;}
+void kernel_thread2(void) {counter—-;}
+
+
+== Dealing with Concurrency
+
+Concurrency allows multiple threads to execute simultaneously and can lead to Race conditions. Kernel provides it’s own locking mechanisms to deal with concurrency namely Mutex and spinlocks.
+
+== Concurrency due to SMP:
+
+SMP, implies a single kernel runs on multiple processors, while sharing all kernel data structures. Thus threads running in multiple cores can modify global data structures and such access have to be synchronised.
+
+A mutex lock is sufficient to provide protection, as shown in below code snippet. The lock guards the variable counter from being accessed by both threads simultaneously. The thread that gets the lock first, updates the counter and other thread can only access the variable when previous thread gives up the lock.
+
+[c, code-snippet]
+
+Static int counter;
+DECLARE_MUTEX(my_lock);
+
+void kernel-thread1(void)
+{
+	down(&my_lock); /* Acquire lock */
+	counter++;	/* critical section */
+	up(&my_lock);	/* gives up lock */ 
+}
+
+void kernel-thread2(void)
+{
+	down(&my_lock);
+	counter—;
+	up(&my_lock);
+}
+
+And spinlock variant for the above is
+
+[c, code-snippet]
+Static int counter;
+spinlock_t my_lock;
+
+void kernel-thread1(void)
+{
+	spin_lock(&my_lock);
+	counter++;
+	spin_unlock(&my_lock);
+}
+
+void kernel-thread2(void)
+{
+	spin_lock(&my_lock);
+	counter—;
+	spin_unlock(&my_lock);
+}
+
+Spinlock busy wait’s a thread while lock is unavailable, whereas Mutex puts a thread to sleep while the lock is unavailable. Spinlocks are to be used, when execution context cannot sleep (inside interrupt handlers).
+
+
+== Concurrency due to kernel preemption:
+A kernel thread, could be preempted by a high priority thread that could access the same data as previous thread.
+
+Consider the situation, where thread1 holds a spinlock and goes into sleep state(due to kernel preemption or thread1 calls a function that sleeps(e.g. put_user())) and the new thread needs to update the same variable counter. In this case, the lock is already taken by sleeping thread(thread1) and new thread will busy wait to get the lock. This will lead to a deadlock situation and cannot be unlocked.
+
+The solution here, is to disable preemption while holding spinlocks and not to call any function that sleeps.
+The problem of preemption is handled within spinlocks itself. Thus, any thread holding a spinlock will have preemption disabled by default in that running processor. 
+
+== Concurrency due to Interrupts:
+Interrupts triggered by hardware, preempts the current thread and could access same global data as interrupted thread.
+
+Consider similar situation, where thread1 holds a spinlock and device issues an interrupt to be handled. The interrupt handler is required to acquire the same lock as thread1. This situation like above leads to a deadlock.
+
+The solution here is to disable interrupts while holding spinlocks. Spinlock has variant APIs to deal with such situations.
+
+e.g.
+
+spin_lock_irqsave(&my_lock, flags); is used to save previous interrupt state and disable interrupts.
+spin_lock_irq(&my_lock); similar to above, but previous interrupt state is not saved.
+spin_lock_bh(&my_lock); disables software interrupts, while enabling hardware interrupts.
+
+
+Important rule with spinlocks, is that it should be held for a minimum time only.
+
+
+
+
+
+
+
+

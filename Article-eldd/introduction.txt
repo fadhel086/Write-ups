@@ -1,0 +1,11 @@
+
+= Introduction
+
+Writing good device driver codes is still challenging for many embedded application programmers. Even though sufficient documentation is available, many still find it hard to understand what are the Do’s and Dont’s for writing driver codes. One of the reason for this is that, Unlike application programming, learning to write drivers requires the author to have fair understanding on 
+1. Microprocessors and device interfacing, 
+2. Services and subsystems provided by the operating system,
+3. Linux kernel architecture.
+
+This article is not focussing on how to write linux driver codes as there are many out there that does, but what are the best practices to follow and extra pieces of information needed while writing simple character drivers.
+
+

@@ -1,0 +1,237 @@
+= Best practices to follow while writing simple character drivers
+Fadhel Habeeb <fadhel@zilogic.com>
+:source-highlighter: prettify
+:stem:	
+:icons: font
+
+== Introduction
+
+Writing good device driver codes is still challenging for many embedded application programmers. Even though sufficient documentation is available, many still find it hard to understand what are the Do’s and Dont’s for writing driver codes. One of the reason for this is that, Unlike application programming, learning to write drivers requires the author to have fair understanding on
+ 
+1. Microprocessors and device interfacing,
+
+2. Linux kernel architecture.
+
+This article is not focussing on how to write linux driver codes as there are many out there that does, but what are the best practices to follow and extra pieces of information needed while writing simple character drivers.
+
+== Understanding the kernel
+
+Linux is a monolithic kernel, i.e. to say that the entire kernel is present at a single address space, known as kernel space. Thus any piece of code, we insert into the kernel is part of the entire kernel. Unlike application programs, kernel code runs with high privileges and drivers inserted by user also runs with high privileges. Thus utmost care must be taken to write kernel modules. A small mistake(non-terminating loops, non-properly de-initialized module, dangling pointers … etc), can bring the entire system down.
+
+Current systems are inherently concurrent, due to Symmetric multiprocessing (SMP), kernel preemption and interrupts. Thus drivers should take care to protect global data structures and hardware resources from corruption or else it could jeopardise the entire system.
+
+Below code snippet shows how simultaneously executing threads can modify a global data in unpredictable ways. The order in which threads modify the variable cannot be predicted and  leads to race condition (Situation when two or more threads tries to access the same resources at the same time).
+
+[source,c]
+.race.c
+-----
+Static int counter;
+
+void kernel_thread1(void) {counter++;}
+void kernel_thread2(void) {counter—-;}
+-----
+
+=== Dealing with Concurrency
+
+Concurrency allows multiple threads to execute simultaneously and can lead to Race conditions. Kernel provides it’s own locking mechanisms to deal with concurrency namely Mutex and spinlocks.
+
+==== Concurrency due to SMP
+
+SMP, implies a single kernel runs on multiple processors, while sharing all kernel data structures. Thus threads running in multiple cores can modify global data structures and such access have to be synchronised.
+
+A mutex lock is sufficient to provide protection, as shown in below code snippet. The lock guards the variable counter from being accessed by both threads simultaneously. The thread that gets the lock first, updates the counter and other thread can only access the variable when previous thread gives up the lock.
+
+[source, c]
+.mutex.c
+-----
+Static int counter;
+DECLARE_MUTEX(my_lock);
+
+void kernel-thread1(void)
+{
+	down(&my_lock); /* Acquire lock */
+	counter++;	/* critical section */
+	up(&my_lock);	/* gives up lock */ 
+}
+
+void kernel-thread2(void)
+{
+	down(&my_lock);
+	counter—;
+	up(&my_lock);
+}
+-----
+
+And spinlock variant for the above is
+
+[source, c]
+.spinlock.c
+-----
+Static int counter;
+spinlock_t my_lock;
+
+void kernel-thread1(void)
+{
+	spin_lock(&my_lock);
+	counter++;
+	spin_unlock(&my_lock);
+}
+
+void kernel-thread2(void)
+{
+	spin_lock(&my_lock);
+	counter—;
+	spin_unlock(&my_lock);
+}
+-----
+
+Spinlock busy wait’s a thread while lock is unavailable, whereas Mutex puts a thread to sleep while the lock is unavailable. Spinlocks are to be used, when execution context cannot sleep (inside interrupt handlers).
+
+
+==== Concurrency due to kernel preemption:
+A kernel thread, could be preempted by a high priority thread that could access the same data as previous thread.
+
+Consider the situation, where thread1 holds a spinlock and goes into sleep state(due to kernel preemption or thread1 calls a function that sleeps(e.g. put_user())) and the new thread needs to update the same variable counter. In this case, the lock is already taken by sleeping thread(thread1) and new thread will busy wait to get the lock. This will lead to a deadlock situation and cannot be unlocked.
+
+The solution here, is to disable preemption while holding spinlocks and not to call any function that sleeps.
+The problem of preemption is handled within spinlocks itself. Thus, any thread holding a spinlock will have preemption disabled by default in that running processor. 
+
+==== Concurrency due to Interrupts:
+Interrupts triggered by hardware, preempts the current thread and could access same global data as interrupted thread.
+
+Consider similar situation, where thread1 holds a spinlock and device issues an interrupt. The interrupt handler is required to acquire the same lock as thread1. This situation like above leads to a deadlock.
+
+The solution here is to disable interrupts while holding spinlocks. Spinlock has variant APIs to deal with such situations.
+
+e.g.
+[source,c]
+.spinlock_variants.c
+-----
+spin_lock_irqsave(&my_lock, flags); /*is used to save previous interrupt state and disable interrupts.*/
+spin_lock_irq(&my_lock); /*similar to above, but previous interrupt state is not saved.*/
+spin_lock_bh(&my_lock); /*disables software interrupts, while enabling hardware interrupts.*/
+-----
+
+Important rule with spinlocks, is that it should be held for a minimum time only.
+
+== Handling Interrupts
+
+One of the complexities handled by the kernel is managing the devices connected to the system. Most of the devices(keyboard, mouse, serial devices etc) connected to the system have much slower clock speed than the processor and the data to be provided by the device are asynchronous. As a result, it is a wastage of processor time to poll for signals from external devices. Devices provide interrupt signals to processor, when it needs to be processed.
+
+In general, interrupt lines from hardware devices are connected to input pins of an Interrupt controller, which multiplexes these into a single line of the processor. Once interrupt is received, interrupt controller signals the processor. The current thread of execution is interrupted and interrupt service routine (ISR) is executed.
+
+=== Criteria to be met by ISR:
+
+1. Ordinary kernel threads executes in process context and could be preempted or could call function that could sleep. An ISR is executing in interrupt context and has no backing process, thus it cannot be preempted nor call any function that could sleep. 
+
+2. ISR’s are being executed by preempting a running kernel, as such ISR’s have to run as quickly as possible, so that interrupted process can resume execution.
+
+In practical programming, meeting above conditions are stringent. Consider a situation where a 4-way keypad is connected to the processor using i2c lines. The key pressed data is read using i2c protocol and processor is notified that a key has been pressed using interrupt line. Thus when keypad has been pressed, it generates an interrupt and respective ISR has to fetch data using i2c protocol.
+
+[source,c]
+-----
+The i2c read/write functions, i.e.
+
+i2c_master_read/write(arg1, arg2, arg3) are blocking I/O calls and sleeps.
+-----
+
+=== Programming ISRs
+
+To deal with above competing situation, kernel developers recommend to split interrupt processing into two halves, known as top and bottom halves. Top half, does time critical work such as acknowledging the interrupt or resetting the hardware. The rest lengthy procedures are done by bottom half. Top half executes in ISR’s , while bottom half executes at a later convenient time, literally known as deferring work in kernel terminology.
+
+=== Deferring work and work queues
+
+Kernel provides a number of mechanisms to implement bottom halves, namely Softirqs, Tasklets and Work queues. Work queues defer work into a kernel thread(worker threads) and as such it runs in process context. Thus it could be preempted or could call functions that sleep.
+
+Implementing the bottom half using work queues, is illustrated below;
+
+1. Initially, the driver will have to initialise a work(bottom half code) and add it to a workqueue.
+
+2.In the interrupt handler, do the immediate processing(Top half) and schedule the work(bottom half).
+
+3. Return from the interrupt handler.
+
+Below code snippet shows the skeleton implementation
+
+[source, c]
+.bottom_half.c
+----- 
+/* create work to be deferred,
+ work_name is the name of the work,
+ work_handler (Bottom half code) is the handler to be executed  */
+
+DECLARE_WORK(work_name, void *work_handler(void *), void *data);
+
+struct workqueue_struct *my_queue;
+
+static int init()
+{
+	/* Initialise hardware device */
+	/* Initialize interrupts from hardware */
+	
+	queue_work(my_queue, my_work);
+}
+
+irqreturn_t Interrupt_handler(int, void *)
+{	
+	/* test if the handler was called for it’s own device */
+	if(condition) 
+	{
+		/* Do the top half of interrupt handler */
+		…
+		..
+		/* call the bottom half */
+		schedule_work(my_work);
+		return IRQ_HANDLED
+	}
+	else
+		return IRQ_NONE
+}
+
+void work_handler(void)
+{
+	/* 
+	   Implement the bottom half of the code
+	   Read from i2c, spi or uart device
+   	*/
+
+}
+
+static void exit(void)
+{
+	/*
+	   De-initialize, the module
+	*/
+}
+-----
+
+=== returning from Interrupt handler
+
+Above code snippet shows two MACROS are returned (IRQ_HANDLED/ IRQ_NONE) from interrupt handler. IRQ_HANDLED indicates that the interrupt handler was called by the correct device and handled appropriately.
+IRQ_NONE, indicates that the handler was called by wrong device and needs to handled appropriately. Kernel then tries to call the appropriate handler.
+
+
+== Conclusion
+
+As mentioned in introduction, writing good driver codes requires fair knowledge in both software and hardware of the system. The article focussed on the what are the best practices to follow while writing simple character drivers.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
